@@ -1,0 +1,56 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import pearsonr
+from sklearn.metrics.pairwise import cosine_distances
+import sys
+
+# === File paths ===
+TEST_PATH = "test.csv"
+PRED_PATH = sys.argv[1]
+OUTPUT_TSV = "evaluation.tsv"
+
+# === Load data ===
+df_test = pd.read_csv(TEST_PATH)
+df_pred = pd.read_csv(PRED_PATH)
+
+# Align on stimulus column
+df_test = df_test.set_index("stimulus").sort_index()
+df_pred = df_pred.set_index("stimulus").sort_index()
+
+# Ensure columns match
+labels = [col for col in df_pred.columns if col in df_test.columns]
+
+results = []
+
+# Per-label evaluation
+for label in labels:
+    y_true = df_test[label].values
+    y_pred = df_pred[label].values
+
+    pearson_corr = pearsonr(y_true, y_pred)[0]
+    cos_dist = cosine_distances(y_true.reshape(1, -1), y_pred.reshape(1, -1))[0, 0]
+
+    results.append((label, pearson_corr, cos_dist))
+
+# Global (ALL) flattened
+all_true = df_test[labels].values.flatten()
+all_pred = df_pred[labels].values.flatten()
+
+global_pearson = pearsonr(all_true, all_pred)[0]
+global_cosine = cosine_distances(all_true.reshape(1, -1), all_pred.reshape(1, -1))[0, 0]
+
+results.append(("ALL", global_pearson, global_cosine))
+
+# Mean across labels (excluding ALL)
+pearson_vals = [r[1] for r in results[:-1]]
+cosine_vals = [r[2] for r in results[:-1]]
+mean_pearson = np.mean(pearson_vals)
+mean_cosine = np.mean(cosine_vals)
+results.append(("MEAN", mean_pearson, mean_cosine))
+
+# Save to TSV
+df_result = pd.DataFrame(results, columns=["label", "pearson", "cosine"])
+df_result.to_csv(OUTPUT_TSV, sep="\t", index=False)
+
+print(f"✅ Evaluation results saved to {OUTPUT_TSV}")
+

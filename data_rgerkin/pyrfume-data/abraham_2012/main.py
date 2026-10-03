@@ -1,0 +1,91 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import pandas as pd
+from pyrfume.odorants import get_cids, from_cids
+
+# From the supplemental materials of:
+# "An Algorithm for 353 Odor Detection Thresholds in Humans"
+# Abraham et al, 2012 (Chemical Senses; 2011 online publication date)
+df = pd.read_excel('ThresholdsAbraham2011.xls')
+
+df['SMILES'] = df['SMILES'].replace({'C(CCC)(=O)O.C#CC': 'CCCC(=O)OCCC'})
+
+# Get CIDs for SMILES given in the original data file
+smiles = df['SMILES'].dropna()
+smiles_cids = get_cids(smiles, kind='SMILES')
+
+# Use these CIDs where possible
+df['CID'] = df['SMILES'].apply(smiles_cids.get, None)
+
+# Replace typos and odd spellings with correct molecule names (whole names)
+subs = {'lsobutylaldehyde': 'isobutyraldehyde',
+        'n-Decylaldehyde': 'decanal',
+        'Methyl sec.butyl ketone': '3-Methyl-2-pentanone',
+        'Methyl tert.butyl ketone': 'Pinacolone',
+        'a-Pinene': 'alpha-Pinene',
+        'Butyl cellosolve  acetate': '2-Butoxyethanol acetate',
+        '2-n-Buthoxyethanol': '2-butoxyethanol',
+        '1-8 Cineole': 'eucalyptol',
+        'n-Propy n-butyrate': 'Propyl butyrate',
+        'D-3-carene': 'delta-3-carene',
+        'sec-Pentanol': '2-pentanol'}
+
+df['Substance'] = df['Substance'].replace(subs)
+
+# Replace typos and odd spellings with correct molecule names (parts of names)
+subs = {'.': '-',
+        'alfa': 'alpha',
+        'ß': 'beta',
+        'mercaptane': 'mercaptan',
+        'acryrale': 'acrylate',
+        '- ': '-'}
+
+for key, value in subs.items():
+    df['Substance'] = df['Substance'].str.replace(key, value, regex=False)
+
+# Get CIDS for molecule names that did not have SMILES (or whose SMILES could not be used)
+names = df[df['CID'].isnull() | (df['CID']==0)]['Substance']
+name_cids = get_cids(names, kind='name')
+
+# Use these CIDs where CIDs could not be found previously
+df.loc[names.index, 'CID'] = df['Substance'].apply(name_cids.get, None)
+
+# Verify that a CID has been found for all molecules
+assert all(df['CID']>0)
+
+# Use the CID as the index and discard other identifiers from original dataset
+df = df.set_index('CID').drop(['Substance', 'SMILES', 'MW'], axis=1)
+df.head()
+
+# There are some duplicate entries so average over duplicates and indicate where this has occurred
+counts = df.groupby('CID')['Log (1/ODT)'].count()
+behavior = df.groupby('CID').mean()
+behavior['Duplicates'] = counts - 1
+
+behavior.sort_index(inplace=True)
+behavior.index.name = 'Stimulus'
+behavior.head()
+
+# Save this to the behavior file
+# behavior.index.name = 'Stimulus'
+behavior.to_csv('behavior.csv')
+
+# Get molecular data from PubChem (for consistency)
+molecules = pd.DataFrame(from_cids(df.index)).set_index('CID')
+
+# Sort index and remove duplicates
+molecules.sort_index(inplace=True)
+molecules = molecules[~molecules.index.duplicated()]
+molecules.head()
+
+# Verfify that both dataframes contain same set of CIDs
+assert behavior.index.equals(molecules.index) 
+
+# Save this to the molecules file
+molecules.to_csv('molecules.csv')
+
+# All stimuli are CIDs
+stimuli = pd.DataFrame(molecules.index, index=molecules.index.tolist())
+stimuli.index.name = 'Stimulus'
+stimuli.to_csv('stimuli.csv')

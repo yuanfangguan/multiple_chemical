@@ -1,0 +1,160 @@
+import pandas as pd
+import lightgbm as lgb
+import os
+import joblib
+import numpy as np
+
+# === File paths ===
+TEST_PATH = "test.csv"
+STIMULUS_MAP_PATH = "../../data/raw/TASK2_Stimulus_definition.csv"
+COMPONENT_MAP_PATH = "../../data/raw/TASK2_Component_definition.csv"
+CID_SMILES_PATH = "../../data/raw/CID.csv"
+RATA_PATH = "../../data/raw/OpenPOM_Dream_RATA.csv"
+SINGLE_RATA_PATH = "../../data/raw/Task2_single_RATA.csv"
+
+FEATURE_SET_PATHS = {
+    "maccs": "../../data/processed/features_maccs.csv",
+    "morgan": "../../data/processed/features_morgan.csv",
+    "rdkitfp": "../../data/processed/features_rdkitfp.csv",
+    "descriptors": "../../data/processed/features_descriptors.csv",
+    "rata": RATA_PATH,
+    "rata_single": SINGLE_RATA_PATH,
+}
+
+MODEL_DIR = "models"
+OUTPUT_CSV = "predictions.csv"
+
+# === Load shared data ===
+df_test = pd.read_csv(TEST_PATH)
+problematic_stimuli = ['AN873']
+df_test = df_test[~df_test['stimulus'].isin(problematic_stimuli)]
+
+df_stim_map = pd.read_csv(STIMULUS_MAP_PATH)
+df_comp_map = pd.read_csv(COMPONENT_MAP_PATH)
+df_cid = pd.read_csv(CID_SMILES_PATH)
+df_rata = pd.read_csv(RATA_PATH)
+df_rata_single = pd.read_csv(SINGLE_RATA_PATH)
+
+component_to_cid = dict(zip(df_comp_map['id'], df_comp_map['CID']))
+component_to_dilution = dict(zip(df_comp_map['id'], df_comp_map['dilution']))
+
+# === Helper: Get list of (CID, dilution) from components string
+def get_cid_dilution_pairs(components_str):
+    comps = str(components_str).split(';')
+    pairs = []
+    for comp_id_str in comps:
+        comp_id_str = comp_id_str.strip()
+        if comp_id_str.isdigit():
+            comp_id = int(comp_id_str)
+            cid = component_to_cid.get(comp_id)
+            dilution = component_to_dilution.get(comp_id)
+            if cid is not None and dilution is not None:
+                pairs.append((cid, float(dilution)))
+    return pairs
+
+# === Prepare final predictions container ===
+stimulus_ids = []
+final_preds = {}
+
+# === For each feature set ===
+for feat_name, feat_path in FEATURE_SET_PATHS.items():
+    print(f"\n=== Processing feature set: {feat_name} ===")
+
+    # === Load features
+    if feat_name == "rata":
+        df_rata_mapped = df_rata.merge(df_cid, on='SMILES', how='inner').drop_duplicates(subset='molecule')
+        rata_feature_columns = [col for col in df_rata_mapped.columns if col not in ('SMILES', 'molecule')]
+        df_rata_mapped[rata_feature_columns] = df_rata_mapped[rata_feature_columns].apply(pd.to_numeric, errors='coerce')
+        df_feats = df_rata_mapped[['molecule'] + rata_feature_columns]
+    elif (feat_name=='rata_single'):
+        df_rata_single_mapped = df_rata_single.merge(df_cid, on='molecule', how='inner').drop_duplicates(subset='molecule')
+        rata_single_feature_columns = [col for col in df_rata_single_mapped.columns if col not in ('SMILES', 'molecule',"stimulus","components","dilution")]
+        df_rata_single_mapped[rata_single_feature_columns] = df_rata_single_mapped[rata_single_feature_columns].apply(pd.to_numeric, errors='coerce')
+        df_feats= df_rata_single_mapped[['molecule'] + rata_single_feature_columns]
+    else:
+        df_feats = pd.read_csv(feat_path)
+        if 'SMILES' in df_feats.columns:
+            df_feats = df_feats.drop(columns=['SMILES'])
+
+
+
+    cid_to_feats = df_feats.set_index('molecule')
+    fingerprint_dim = cid_to_feats.shape[1]
+    augmented_dim = fingerprint_dim + 1
+
+    # === Build stimulus → (CID, dilution) pairs
+    stimulus_to_pairs = {}
+    max_components = 0
+    df_stim_map_filtered = df_stim_map[df_stim_map['id'].isin(df_test['stimulus'])]
+
+    for _, row in df_stim_map_filtered.iterrows():
+        stim = row['id']
+        pairs = [(cid, dilution) for cid, dilution in get_cid_dilution_pairs(row['components']) if cid in cid_to_feats.index]
+        if pairs:
+            stimulus_to_pairs[stim] = pairs
+            max_components = max(max_components, len(pairs))
+
+    print(f"📌 Max components for {feat_name}: {max_components}")
+    print(f"📌 Augmented dim per component: {augmented_dim}")
+
+    # === Build feature matrix (original and reversed)
+    X_test_original = []
+    X_test_reversed = []
+    test_ids = []
+
+    def build_feature_vector(pairs):
+        vecs = []
+        for cid, dilution in pairs:
+            f = cid_to_feats.loc[cid].values
+            vecs.append(np.append(f, dilution))
+        while len(vecs) < max_components:
+            vecs.append(np.zeros(augmented_dim))
+        return np.concatenate(vecs)
+
+    for _, row in df_test.iterrows():
+        stim = row['stimulus']
+        if stim in stimulus_to_pairs:
+            pairs = stimulus_to_pairs[stim]
+            X_test_original.append(build_feature_vector(pairs))
+            X_test_reversed.append(build_feature_vector(pairs[::-1]))
+            test_ids.append(stim)
+        else:
+            print(f"⚠️ No features found for stimulus: {stim}")
+
+    if not stimulus_ids:
+        stimulus_ids = test_ids
+
+    X_test_original = pd.DataFrame(X_test_original)
+    X_test_reversed = pd.DataFrame(X_test_reversed)
+
+    # === Load models and predict
+    model_subdir = os.path.join(MODEL_DIR, feat_name)
+    for model_file in os.listdir(model_subdir):
+        if not model_file.endswith(".pkl"):
+            continue
+        label = model_file.replace("model_", "").replace(".pkl", "")
+        model_path = os.path.join(model_subdir, model_file)
+        print(f"🔍 [{feat_name}] Loading model: {label}")
+        model = joblib.load(model_path)
+        preds_orig = model.predict(X_test_original)
+        preds_rev = model.predict(X_test_reversed)
+        preds_avg = (preds_orig + preds_rev) / 2.0
+
+        if label not in final_preds:
+            final_preds[label] = preds_avg
+        else:
+            final_preds[label] += preds_avg
+
+# === Average predictions across feature sets
+num_feature_sets = len(FEATURE_SET_PATHS)
+for label in final_preds:
+    final_preds[label] /= num_feature_sets
+
+# === Save final predictions
+predictions_df = pd.DataFrame({'stimulus': stimulus_ids})
+for label in sorted(final_preds.keys()):
+    predictions_df[label] = final_preds[label]
+
+predictions_df.to_csv(OUTPUT_CSV, index=False)
+print(f"\n✅ Final averaged predictions saved to {OUTPUT_CSV}")
+

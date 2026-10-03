@@ -1,0 +1,16 @@
+python3 split.py 0
+python3 train.py 0
+python3 train.py 1
+python3 train.py 2
+python3 train.py 3
+python3 train.py 4
+python3 predict.py 0
+python3 predict.py 1
+python3 predict.py 2
+python3 predict.py 3
+python3 predict.py 4
+python3 evaluate.py 0
+python3 evaluate.py 1
+python3 evaluate.py 2
+python3 evaluate.py 3
+python3 evaluate.py 4
